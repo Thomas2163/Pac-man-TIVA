@@ -22,8 +22,9 @@
 #endif
 
 #define SW1             (1U<<4)
-#define Reloj_Sistema   16000000UL // 16 MHz
+#define Reloj_Sistema   80000000UL // para 80 MHz, o 16000000UL para 16 MHz
 
+// Notas
 // Notas
 #define NOTE_B4  494
 #define NOTE_C5  523
@@ -102,48 +103,8 @@
 #define NOTE_GS4 415
 #define NOTE_A4  440
 #define NOTE_AS4 466
-#define NOTE_B4  494
-#define NOTE_C5  523
-#define NOTE_CS5 554
-#define NOTE_D5  587
-#define NOTE_DS5 622
-#define NOTE_E5  659
-#define NOTE_F5  698
-#define NOTE_FS5 740
-#define NOTE_G5  784
-#define NOTE_GS5 831
-#define NOTE_A5  880
-#define NOTE_AS5 932
-#define NOTE_B5  988
-#define NOTE_C6  1047
-#define NOTE_CS6 1109
-#define NOTE_D6  1175
-#define NOTE_DS6 1245
-#define NOTE_E6  1319
-#define NOTE_F6  1397
-#define NOTE_FS6 1480
-#define NOTE_G6  1568
-#define NOTE_GS6 1661
-#define NOTE_A6  1760
-#define NOTE_AS6 1865
-#define NOTE_B6  1976
-#define NOTE_C7  2093
-#define NOTE_CS7 2217
-#define NOTE_D7  2349
-#define NOTE_DS7 2489
-#define NOTE_E7  2637
-#define NOTE_F7  2794
-#define NOTE_FS7 2960
-#define NOTE_G7  3136
-#define NOTE_GS7 3322
-#define NOTE_A7  3520
-#define NOTE_AS7 3729
-#define NOTE_B7  3951
-#define NOTE_C8  4186
-#define NOTE_CS8 4435
-#define NOTE_D8  4699
-#define NOTE_DS8 4978
 #define REST      0
+// (el resto de tu código sigue igual)
 
 // Melodías de Pac-Man
 // 1. Melodía de INICIO
@@ -214,60 +175,72 @@ void config_switches(void) {
 }
 
 void config_timer3_pwm(uint32_t freq) {
-    // Habilitar Timer3 y GPIOB
     SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER3);
     while(!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER3));
     SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
     while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOB));
 
-    // Configurar PB4 como T3CCP0 para PWM
     GPIOPinConfigure(GPIO_PB4_T3CCP0);
     GPIOPinTypeTimer(GPIO_PORTB_BASE, GPIO_PIN_4);
 
-    // Deshabilitar Timer3A antes de configurar
     TimerDisable(TIMER3_BASE, TIMER_A);
-    // Split pair: A en PWM, B en periodic
-    TimerConfigure(TIMER3_BASE, TIMER_CFG_SPLIT_PAIR |
-                              TIMER_CFG_A_PWM    |
-                              TIMER_CFG_B_PERIODIC);
 
     // Calcular periodo para la frecuencia deseada
     uint32_t period = Reloj_Sistema / freq;
-    uint8_t prescale = (period >> 16) & 0xFF;          // 8 bits más significativos
-    uint32_t load = period / (prescale + 1);           // 16 bits menos significativos
+    uint8_t prescale = 0;
+    uint32_t load = period;
 
-    // Cargar prescaler y periodo
+    // Ajusta automáticamente prescaler y load
+    while (load > 65535 && prescale < 255) {
+        prescale++;
+        load = period / (prescale + 1);
+    }
+
+    if (load > 65535) {
+        TimerDisable(TIMER3_BASE, TIMER_A); // Nota muy grave, ignora
+        return;
+    }
+
     TimerPrescaleSet(TIMER3_BASE, TIMER_A, prescale);
     TimerLoadSet(TIMER3_BASE, TIMER_A, load - 1);
 
-    // Configurar duty cycle al 50%
+    // Duty cycle 50%
     uint32_t match = load / 2;
     TimerPrescaleMatchSet(TIMER3_BASE, TIMER_A, prescale);
     TimerMatchSet(TIMER3_BASE, TIMER_A, match - 1);
 
-    // Habilitar Timer3A para PWM
     TimerEnable(TIMER3_BASE, TIMER_A);
 }
 
 void config_timer3b_interrupt(uint32_t ms) {
-    // Asegurar Timer3 habilitado
     SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER3);
     while(!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER3));
 
-    // Deshabilitar Timer3B antes de configurar
     TimerDisable(TIMER3_BASE, TIMER_B);
-    
-    // Calcular ticks para ms milisegundos
-    uint32_t ticks = (Reloj_Sistema / 1000) * ms;
-    TimerLoadSet(TIMER3_BASE, TIMER_B, ticks - 1);
 
-    // Habilitar interrupción por timeout en B
+    uint32_t ticks = (Reloj_Sistema / 1000) * ms;
+    uint8_t prescale = 0;
+    uint32_t load = ticks;
+
+    // Ajusta automáticamente prescaler y load
+    while (load > 65535 && prescale < 255) {
+        prescale++;
+        load = ticks / (prescale + 1);
+    }
+
+    if (load > 65535) {
+        TimerDisable(TIMER3_BASE, TIMER_B); // Tiempo muy largo, ignora
+        return;
+    }
+
+    TimerPrescaleSet(TIMER3_BASE, TIMER_B, prescale);
+    TimerLoadSet(TIMER3_BASE, TIMER_B, load - 1);
+
     TimerIntClear(TIMER3_BASE, TIMER_TIMB_TIMEOUT);
     TimerIntEnable(TIMER3_BASE, TIMER_TIMB_TIMEOUT);
     IntPrioritySet(INT_TIMER3B, 0);
     IntEnable(INT_TIMER3B);
 
-    // Habilitar Timer3B periódico
     TimerEnable(TIMER3_BASE, TIMER_B);
 }
 
@@ -308,7 +281,7 @@ void Timer3B_Handler(void) {
 
 int main(void) {
     // Configurar reloj a 16 MHz
-    SysCtlClockSet(SYSCTL_SYSDIV_5 | SYSCTL_USE_PLL | SYSCTL_XTAL_16MHZ | SYSCTL_OSC_MAIN);
+   SysCtlClockSet(SYSCTL_SYSDIV_5 | SYSCTL_USE_PLL | SYSCTL_XTAL_16MHZ | SYSCTL_OSC_MAIN);
     
     // Configurar switch en PF4
     config_switches();
