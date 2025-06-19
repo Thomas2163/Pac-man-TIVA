@@ -281,7 +281,7 @@ void Timer3B_Handler(void) {
 
 int main(void) {
     // Configurar reloj a 16 MHz
-   SysCtlClockSet(SYSCTL_SYSDIV_5 | SYSCTL_USE_PLL | SYSCTL_XTAL_16MHZ | SYSCTL_OSC_MAIN);
+   SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL | SYSCTL_XTAL_16MHZ | SYSCTL_OSC_MAIN);
     
     // Configurar switch en PF4
     config_switches();
