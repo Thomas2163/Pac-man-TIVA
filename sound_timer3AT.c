@@ -1,29 +1,27 @@
 /********************************************************************************************
- * Descripcion: El programa genera una melodía utilizando el TIMER3A con playback basado en interrupciones
- *              y evita el uso de TIMER0, TIMER1 y TIMER2 (reservados para VGA).
+ * Descripcion: El programa genera una melodía utilizando el TIMER3A con playback basado en 
+ *              interrupciones. Ajusta la duración de cada nota con el mismo factor 1.3×  
  * Conexion:   PB2 -> BUZZER (T3CCP0)
  ********************************************************************************************/
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include "tm4c123gh6pm.h"
 #include "hw_memmap.h"
-#include "hw_types.h"
 #include "sysctl.h"
 #include "gpio.h"
 #include "pin_map.h"
 #include "timer.h"
 #include "interrupt.h"
 
-// Definición manual en caso de no disponer de pin_map.h:
 #ifndef GPIO_PB2_T3CCP0
-#define GPIO_PB2_T3CCP0  (0x7 << (2 * 4))  // PCTL AF7 en PB2
+#define GPIO_PB2_T3CCP0  (0x7 << (2 * 4))  // AF7 en PB2 = T3CCP0
 #endif
 
-#define SW1             (1U<<4)
 #define Reloj_Sistema   80000000UL // 80 MHz
 
-// -- Definición de notas (igual al original) --
+// … tu lista completa de notas …
 #define NOTE_B4  494
 #define NOTE_C5  523
 #define NOTE_CS5 554
@@ -101,9 +99,50 @@
 #define NOTE_GS4 415
 #define NOTE_A4  440
 #define NOTE_AS4 466
+#define NOTE_B4  494
+#define NOTE_C5  523
+#define NOTE_CS5 554
+#define NOTE_D5  587
+#define NOTE_DS5 622
+#define NOTE_E5  659
+#define NOTE_F5  698
+#define NOTE_FS5 740
+#define NOTE_G5  784
+#define NOTE_GS5 831
+#define NOTE_A5  880
+#define NOTE_AS5 932
+#define NOTE_B5  988
+#define NOTE_C6  1047
+#define NOTE_CS6 1109
+#define NOTE_D6  1175
+#define NOTE_DS6 1245
+#define NOTE_E6  1319
+#define NOTE_F6  1397
+#define NOTE_FS6 1480
+#define NOTE_G6  1568
+#define NOTE_GS6 1661
+#define NOTE_A6  1760
+#define NOTE_AS6 1865
+#define NOTE_B6  1976
+#define NOTE_C7  2093
+#define NOTE_CS7 2217
+#define NOTE_D7  2349
+#define NOTE_DS7 2489
+#define NOTE_E7  2637
+#define NOTE_F7  2794
+#define NOTE_FS7 2960
+#define NOTE_G7  3136
+#define NOTE_GS7 3322
+#define NOTE_A7  3520
+#define NOTE_AS7 3729
+#define NOTE_B7  3951
+#define NOTE_C8  4186
+#define NOTE_CS8 4435
+#define NOTE_D8  4699
+#define NOTE_DS8 4978
 #define REST      0
 
-// Melodías de Pac-Man (igual al original)
+// Melodía de inicio
 // 1. Melodía de INICIO
 int melody_inicio[] = {
   NOTE_B4, NOTE_B5, NOTE_FS5, NOTE_DS5, NOTE_B5, NOTE_FS5, NOTE_DS5,
@@ -156,131 +195,111 @@ int durations_fantasma[] = {
   16, 16, 16, 16, 16, 16
 };
 
-
-// Variables globales para ISR
 volatile int *g_melody;
 volatile int *g_durations;
-volatile int  g_melodyLength;
-volatile int  g_noteIndex;
+volatile int  g_length;
+volatile int  g_index;
 
-void config_switches(void) {
-    // PF4 como entrada con pull-up
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
-    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOF));
-    GPIOPinTypeGPIOInput(GPIO_PORTF_BASE, GPIO_PIN_4);
-    GPIOPadConfigSet(GPIO_PORTF_BASE, GPIO_PIN_4,
-                     GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
-}
-
-void config_timer3_pwm(uint32_t freq) {
-    // Habilita Timer3A y GPIOB
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER3);
-    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER3));
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
-    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOB));
-
-    // Configura PB2 como T3CCP0
-    GPIOPinConfigure(GPIO_PB2_T3CCP0);
-    GPIOPinTypeTimer(GPIO_PORTB_BASE, GPIO_PIN_2);
+// Configura TIMER3A en PWM 50% en PB2
+void config_timer3a_pwm(uint32_t freq) {
+    uint32_t period = Reloj_Sistema / freq;
+    uint32_t prescale = period >> 16;
+    uint32_t load     = period & 0xFFFF;
+    if(load == 0) { prescale--; load = 0xFFFF; }
 
     TimerDisable(TIMER3_BASE, TIMER_A);
-    
-    // Calcula período y prescaler
-    uint32_t period = Reloj_Sistema / freq;
-    uint8_t prescale = 0;
-    uint32_t load = period;
-    while(load > 65535 && prescale < 255) {
-        prescale++;
-        load = period / (prescale + 1);
-    }
-    if(load > 65535) return;
-
     TimerPrescaleSet(TIMER3_BASE, TIMER_A, prescale);
     TimerLoadSet     (TIMER3_BASE, TIMER_A, load - 1);
-    // 50% duty
-    TimerPrescaleMatchSet(TIMER3_BASE, TIMER_A, prescale);
-    TimerMatchSet       (TIMER3_BASE, TIMER_A, load/2 - 1);
-    TimerEnable(TIMER3_BASE, TIMER_A);
+    TimerMatchSet    (TIMER3_BASE, TIMER_A, (load/2) - 1);
+    TimerEnable      (TIMER3_BASE, TIMER_A);
 }
 
-void config_timer3b_interrupt(uint32_t ms) {
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER3);
-    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER3));
+// Configura TIMER3B split para timeout en 'ticks'
+void config_timer3b_ticks(uint32_t ticks) {
+    uint32_t prescale = ticks >> 16;
+    uint32_t load     = ticks & 0xFFFF;
+    if(load == 0) { prescale--; load = 0xFFFF; }
 
     TimerDisable(TIMER3_BASE, TIMER_B);
-    uint32_t ticks = (Reloj_Sistema / 1000) * ms;
-    uint8_t prescale = 0;
-    uint32_t load = ticks;
-    while(load > 65535 && prescale < 255) {
-        prescale++;
-        load = ticks / (prescale + 1);
-    }
-    if(load > 65535) return;
-
     TimerPrescaleSet(TIMER3_BASE, TIMER_B, prescale);
     TimerLoadSet     (TIMER3_BASE, TIMER_B, load - 1);
     TimerIntClear    (TIMER3_BASE, TIMER_TIMB_TIMEOUT);
     TimerIntEnable   (TIMER3_BASE, TIMER_TIMB_TIMEOUT);
-    IntPrioritySet   (INT_TIMER3B, 0);
     IntEnable        (INT_TIMER3B);
     TimerEnable      (TIMER3_BASE, TIMER_B);
 }
 
+// Arranca la melodía usando interrupciones
 void startMelody_IT(int *melody, int *durations, int length) {
-    g_melody      = melody;
-    g_durations   = durations;
-    g_melodyLength= length;
-    g_noteIndex   = 0;
-    if(melody[0] > 0) config_timer3_pwm(melody[0]);
+    g_melody    = melody;
+    g_durations = durations;
+    g_length    = length;
+    g_index     = 0;
+
+    // calcula ms base y aplica punteado + factor 1.3
     int base = abs(durations[0]);
     int ms   = 1000 / base;
     if(durations[0] < 0) ms = ms * 3 / 2;
-    config_timer3b_interrupt(ms);
+    ms = (ms * 13) / 10;  // factor 1.3×
+
+    if(melody[0] > 0) {
+        config_timer3a_pwm(melody[0]);
+    }
+    uint32_t ticks = (Reloj_Sistema / 1000) * ms;
+    config_timer3b_ticks(ticks);
 }
 
+// ISR: avanza a la siguiente nota
 void Timer3B_Handler(void) {
     TimerIntClear(TIMER3_BASE, TIMER_TIMB_TIMEOUT);
     TimerDisable(TIMER3_BASE, TIMER_A);
-    g_noteIndex++;
-    if(g_noteIndex < g_melodyLength) {
-        int freq = g_melody[g_noteIndex];
-        int dur  = abs(g_durations[g_noteIndex]);
-        int ms   = 1000 / dur;
-        if(g_durations[g_noteIndex] < 0) ms = ms * 3 / 2;
-        if(freq > 0) config_timer3_pwm(freq);
-        TimerLoadSet(TIMER3_BASE, TIMER_B, (Reloj_Sistema/1000)*ms - 1);
+
+    g_index++;
+    if(g_index < g_length) {
+        int freq = g_melody[g_index];
+        int base = abs(g_durations[g_index]);
+        int ms   = 1000 / base;
+        if(g_durations[g_index] < 0) 
+            ms = ms * 3 / 2;
+        ms = (ms * 13) / 10;  // aplica factor 1.3×
+
+        if(freq > 0) {
+            config_timer3a_pwm(freq);
+        }
+        uint32_t ticks = (Reloj_Sistema / 1000) * ms;
+        config_timer3b_ticks(ticks);
     }
 }
 
 int main(void) {
-    // Configura reloj a 80 MHz
-    SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL |
-                   SYSCTL_XTAL_16MHZ | SYSCTL_OSC_MAIN);
+    // reloj 80 MHz
+    SysCtlClockSet(SYSCTL_SYSDIV_2_5 |
+                   SYSCTL_USE_PLL    |
+                   SYSCTL_XTAL_16MHZ |
+                   SYSCTL_OSC_MAIN);
 
-    // Habilita Timer3 y GPIOB, y configura sub-timer A en PWM y B en periódico
+    // habilita TIMER3 y configura split A=PWM, B=periódico
     SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER3);
     while(!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER3));
+    TimerConfigure(TIMER3_BASE,
+                   TIMER_CFG_SPLIT_PAIR |
+                   TIMER_CFG_A_PWM      |
+                   TIMER_CFG_B_PERIODIC);
+
+    // configura PB2 para T3CCP0
     SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
     while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOB));
-    TimerConfigure(TIMER3_BASE,
-                   TIMER_CFG_SPLIT_PAIR    |  // Divide en A/B 16 bits
-                   TIMER_CFG_A_PWM         |  // A como PWM
-                   TIMER_CFG_B_PERIODIC);     // B como periódico (para ISR)
+    GPIOPinConfigure(GPIO_PB2_T3CCP0);
+    GPIOPinTypeTimer(GPIO_PORTB_BASE, GPIO_PIN_2);
 
-    // Configuración de switch PF4
-    config_switches();
-
-    // Registra ISR de Timer3B y habilita interrupciones
+    // registra ISR y arranca
     IntRegister(INT_TIMER3B, Timer3B_Handler);
-    IntEnable(INT_TIMER3B);
     IntMasterEnable();
-
-    // Inicia reproducción de la melodía con interrupciones
     startMelody_IT(melody_inicio, durations_inicio,
                    sizeof(melody_inicio)/sizeof(int));
 
-    // Bucle vacío; playback ocurre en la ISR
     while(1) {}
+    return 0;
 }
 
 
