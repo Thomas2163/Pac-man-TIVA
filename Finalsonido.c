@@ -3,21 +3,23 @@
 #include <stdlib.h>
 #include "tm4c123gh6pm.h"
 #include "hw_memmap.h"
+#include "hw_types.h"
+#include "hw_ints.h"
 #include "sysctl.h"
 #include "gpio.h"
 #include "pin_map.h"
 #include "timer.h"
 #include "interrupt.h"
 
-// Definición manual si no está presente
+// Si no existiera en pin_map.h:
 #ifndef GPIO_PB2_T3CCP0
 #define GPIO_PB2_T3CCP0  (0x7 << (2 * 4))  // AF7 en PB2 = T3CCP0
 #endif
 
-#define SW1             (1U<<4)
-#define Reloj_Sistema   80000000UL // 80 MHz
+#define Reloj_Sistema 80000000UL  // 80 MHz del PLL
+#define TEMPO          200       // Beats Per Minute (BPM)
 
-// Notas definidas (toda tu lista de notas)
+// --- Lista de notas (recorta/añade según necesites) ---
 #define NOTE_B4  494
 #define NOTE_C5  523
 #define NOTE_CS5 554
@@ -137,9 +139,8 @@
 #define NOTE_D8  4699
 #define NOTE_DS8 4978
 #define REST      0
-// … (toda la lista sigue igual) …
 
-// Melodía de inicio
+// Melodía de INICIO
 // 1. Melodía de INICIO
 int melody_inicio[] = {
   NOTE_B4, NOTE_B5, NOTE_FS5, NOTE_DS5, NOTE_B5, NOTE_FS5, NOTE_DS5,
@@ -191,119 +192,146 @@ int melody_fantasma[] = {
 int durations_fantasma[] = {
   16, 16, 16, 16, 16, 16
 };
-// Variables para la ISR
-volatile int *g_melody;
-volatile int *g_durations;
-volatile int  g_length;
-volatile int  g_index;
-volatile bool melody_complete = true;  // Variable para detectar cuando termina la melodía
 
-// Configura el temporizador TIMER3A como PWM en PB2
+// Variables globales para la reproducción
+volatile int  *g_melody;
+volatile int  *g_durations;
+volatile int   g_length;
+volatile int   g_index;
+volatile bool  melody_complete = true;
+
+// ----------------------------------------------------------------------------
+//  Timer3A: PWM en PB2 para generar la frecuencia del buzzer
+// ----------------------------------------------------------------------------
 void config_timer3a_pwm(uint32_t freq) {
-    uint32_t period = Reloj_Sistema / freq;
+    uint32_t period   = Reloj_Sistema / freq;
     uint32_t prescale = period >> 16;
-    uint32_t load     = period & 0xFFFF;
-    if(load == 0) { prescale--; load = 0xFFFF; }
+    uint32_t load     = period &  0xFFFF;
+    if(load == 0) {
+        prescale--;
+        load = 0xFFFF;
+    }
 
-    TimerDisable(TIMER3_BASE, TIMER_A);
+    TimerDisable    (TIMER3_BASE, TIMER_A);
     TimerPrescaleSet(TIMER3_BASE, TIMER_A, prescale);
-    TimerLoadSet     (TIMER3_BASE, TIMER_A, load - 1);
-    TimerMatchSet    (TIMER3_BASE, TIMER_A, (load/2) - 1);
-    TimerEnable      (TIMER3_BASE, TIMER_A);
+    TimerLoadSet    (TIMER3_BASE, TIMER_A, load - 1);
+    TimerMatchSet   (TIMER3_BASE, TIMER_A, (load / 2) - 1);  // 50% duty
+    TimerEnable     (TIMER3_BASE, TIMER_A);
 }
 
-// Configura TIMER3B para hacer timeout con 'ticks'
-void config_timer3b_ticks(uint32_t ticks) {
-    uint32_t prescale = ticks >> 16;
-    uint32_t load     = ticks & 0xFFFF;
-    if(load == 0) { prescale--; load = 0xFFFF; }
-
-    TimerDisable(TIMER3_BASE, TIMER_B);
-    TimerPrescaleSet(TIMER3_BASE, TIMER_B, prescale);
-    TimerLoadSet     (TIMER3_BASE, TIMER_B, load - 1);
-    TimerIntClear    (TIMER3_BASE, TIMER_TIMB_TIMEOUT);
-    TimerIntEnable   (TIMER3_BASE, TIMER_TIMB_TIMEOUT);
-    IntEnable        (INT_TIMER3B);
-    TimerEnable      (TIMER3_BASE, TIMER_B);
+// ----------------------------------------------------------------------------
+//  Wide Timer3B: programa un timeout de hasta ~53 segundos (32-bit)
+// ----------------------------------------------------------------------------
+void config_wtimer3b_ticks(uint32_t ticks) {
+    // ticks = Reloj_Sistema/1000 * note_ms
+    TimerDisable    (WTIMER3_BASE, TIMER_B);
+    TimerLoadSet    (WTIMER3_BASE, TIMER_B, ticks - 1);
+    TimerIntClear   (WTIMER3_BASE, TIMER_TIMB_TIMEOUT);
+    TimerIntEnable  (WTIMER3_BASE, TIMER_TIMB_TIMEOUT);
+    IntEnable       (INT_WTIMER3B);
+    TimerEnable     (WTIMER3_BASE, TIMER_B);
 }
 
-// Inicia la melodía usando interrupciones
+// ----------------------------------------------------------------------------
+//  Inicia la reproducción de una melodía usando interrupciones
+// ----------------------------------------------------------------------------
 void startMelody_IT(int *melody, int *durations, int length) {
     g_melody    = melody;
     g_durations = durations;
     g_length    = length;
     g_index     = 0;
 
-    // calcula ms base y aplica punteado + factor 1.3
-    int base = abs(durations[0]);
-    int ms   = 1000 / base;
-    if(durations[0] < 0) ms = ms * 3 / 2;
-    ms = (ms * 13) / 10;  // factor 1.3×
+    // Duración de "whole note" (redonda) en ms = 4 × (60000 / TEMPO)
+    uint32_t wholenote_ms = (60000U / TEMPO) * 4U;
 
+    // Calcula duración de la primera nota
+    int base = abs(durations[0]);
+    uint32_t note_ms = wholenote_ms / base;
+    if(durations[0] < 0) note_ms = note_ms * 3U / 2U;
+
+    // Enciende PWM de la primera nota
     if(melody[0] > 0) {
         config_timer3a_pwm(melody[0]);
     }
-    uint32_t ticks = (Reloj_Sistema / 1000) * ms;
-    config_timer3b_ticks(ticks);
+
+    // Programa el timeout en WideTimer3B
+    uint32_t ticks = (Reloj_Sistema / 1000U) * note_ms;
+    config_wtimer3b_ticks(ticks);
 }
 
-// ISR: avanza a la siguiente nota
+// ----------------------------------------------------------------------------
+//  ISR de WideTimer3B: apaga la nota actual y avanza a la siguiente
+// ----------------------------------------------------------------------------
 void Timer3B_Handler(void) {
-    TimerIntClear(TIMER3_BASE, TIMER_TIMB_TIMEOUT);
-    TimerDisable(TIMER3_BASE, TIMER_A);
+    TimerIntClear(WTIMER3_BASE, TIMER_TIMB_TIMEOUT);
+    TimerDisable (TIMER3_BASE,    TIMER_A);  // apaga PWM
 
     g_index++;
     if(g_index < g_length) {
-        int freq = g_melody[g_index];
-        int base = abs(g_durations[g_index]);
-        int ms   = 1000 / base;
-        if(g_durations[g_index] < 0) 
-            ms = ms * 3 / 2;
-        ms = (ms * 13) / 10;  // aplica factor 1.3×
+        uint32_t freq = g_melody[g_index];
+        int base      = abs(g_durations[g_index]);
+
+        uint32_t wholenote_ms = (60000U / TEMPO) * 4U;
+        uint32_t note_ms      = wholenote_ms / base;
+        if(g_durations[g_index] < 0) note_ms = note_ms * 3U / 2U;
 
         if(freq > 0) {
             config_timer3a_pwm(freq);
         }
-        uint32_t ticks = (Reloj_Sistema / 1000) * ms;
-        config_timer3b_ticks(ticks);
+        uint32_t ticks = (Reloj_Sistema / 1000U) * note_ms;
+        config_wtimer3b_ticks(ticks);
     } else {
-        melody_complete = true;  // La melodía terminó
+        // terminó la melodía
+        melody_complete = true;
     }
 }
 
+// ----------------------------------------------------------------------------
+//  main(): inicializa hardware y entra en bucle de reproducción continua
+// ----------------------------------------------------------------------------
 int main(void) {
-    // reloj a 80 MHz
+    // 1) Configura reloj a 80 MHz
     SysCtlClockSet(SYSCTL_SYSDIV_2_5 |
                    SYSCTL_USE_PLL    |
                    SYSCTL_XTAL_16MHZ |
                    SYSCTL_OSC_MAIN);
 
-    // habilita TIMER3 y configura split A=PWM, B=periódico
+    // 2) Habilita bloques Timer3 (PWM) y WideTimer3 (duración) y GPIOB
     SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER3);
-    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER3));
-    TimerConfigure(TIMER3_BASE,
-                   TIMER_CFG_SPLIT_PAIR |
-                   TIMER_CFG_A_PWM      |
-                   TIMER_CFG_B_PERIODIC);
-
-    // configura PB2 para T3CCP0
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_WTIMER3);
     SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
-    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOB));
+    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER3) ||
+          !SysCtlPeripheralReady(SYSCTL_PERIPH_WTIMER3) ||
+          !SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOB));
+
+    // 3) Configura Timer3A como PWM + WideTimer3B como periódico
+    TimerConfigure(TIMER3_BASE,
+        TIMER_CFG_SPLIT_PAIR |
+        TIMER_CFG_A_PWM
+    );
+    TimerConfigure(WTIMER3_BASE,
+        TIMER_CFG_SPLIT_PAIR    |
+        TIMER_CFG_B_PERIODIC
+    );
+
+    // 4) Mapea PB2 a T3CCP0 y lo habilita como salida de timer
     GPIOPinConfigure(GPIO_PB2_T3CCP0);
     GPIOPinTypeTimer(GPIO_PORTB_BASE, GPIO_PIN_2);
 
-    // registra ISR
-    IntRegister(INT_TIMER3B, Timer3B_Handler);
+    // 5) Registra la ISR y habilita interrupciones globales
+    IntRegister(INT_WTIMER3B, Timer3B_Handler);
     IntMasterEnable();
 
-    // Repetir la melodía continuamente mientras esté en 'melody_complete'
+    // 6) Bucle principal: cuando termine la melodía, la vuelve a iniciar
     while(1) {
-        if (melody_complete) {
-            melody_complete = false;  // marca que la melodía está en ejecución
-            startMelody_IT(melody_inicio, durations_inicio,
-                           sizeof(melody_inicio)/sizeof(int));
+        if(melody_complete) {
+            melody_complete = false;
+            startMelody_IT(
+              melody_inicio,
+              durations_inicio,
+              sizeof(melody_inicio)/sizeof(int)
+            );
         }
     }
-
-    return 0;
 }
+
